@@ -6,23 +6,25 @@ The project focuses on identifying vulnerabilities such as reentrancy, access co
 
 ## Features
 
-- Static analysis of Solidity smart contracts.
-- CFG and DFG construction for semantic reasoning.
-- Inter-procedural taint propagation from sensitive sources to sinks.
-- Modular detector architecture for multiple vulnerability classes.
-- CVSS-inspired severity scoring.
-- Benchmark support for SmartBugs Curated and SolidiFI datasets.
-- Structured output for reporting and evaluation.
+- **Static Analysis**: Deep semantic reasoning via CFG, DFG, and inter-procedural taint propagation.
+- **Multi-Class Detection**: Identifies reentrancy, access control issues, arithmetic flaws, unchecked return values, timestamp dependence, weak randomness, delegatecall misuse, denial of service, tx.origin misuse, and logic errors.
+- **Web Interface (New)**: A modern, responsive dashboard to run scans and view interactive reports.
+- **Multilingual AI Assistant (New)**: A browser-based AI layer that explains vulnerabilities in simple language, with built-in voice support (Speech-to-Text & Text-to-Speech) for English, Hindi, and Hinglish.
+- **Asynchronous API Engine**: Built on FastAPI to process scans off the main event loop, enabling multi-user concurrency without blocking.
+- **Benchmark Support**: Integrates with SmartBugs Curated and SolidiFI datasets.
 
 ## Project Structure
 
 ```text
 vigilancecore_hackathon/
-├── main.py
+├── api_main.py          # FastAPI application entry point
+├── api/                 # API routing and backend logic
+├── frontend/            # HTML/JS/CSS for the dashboard & AI Assistant
+├── main.py              # CLI entry point
 ├── config.py
 ├── requirements.txt
-├── core/
-├── detectors/
+├── core/                # Core static analysis engine (Slither integration, graphs)
+├── detectors/           # Specific vulnerability detection logic
 ├── tests/
 ├── reports/
 ├── patches/
@@ -88,12 +90,20 @@ python -c "import solcx; solcx.install_solc('0.8.21')"
 
 ## Usage
 
-Run the main analysis script:
+### Running the Web Application
+To run the modern web-based UI and API server:
+
+```powershell
+python -m uvicorn api_main:app --reload --host 127.0.0.1 --port 8000
+```
+Then navigate to `http://127.0.0.1:8000` in your web browser.
+
+### Running the CLI
+To run the main analysis script via the command line:
 
 ```powershell
 python main.py
 ```
-
 To analyze a specific Solidity file, update the input path in the configuration or runner script depending on your setup.
 
 ## Test Contracts
