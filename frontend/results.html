@@ -10,6 +10,7 @@
   <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&display=swap" rel="stylesheet">
   <link rel="stylesheet" href="/frontend/styles.css" />
   <link rel="stylesheet" href="/frontend/ai-chat.css" />
+  <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
 </head>
 <body>
   <div class="noise"></div>
@@ -76,21 +77,18 @@
         </article>
       </div>
 
-      <div class="severity-breakdown">
-        <div class="severity-row critical">
-          <span>Critical</span><span id="countCritical">0</span>
+      <div class="dashboard-charts">
+        <div class="chart-card">
+          <h3>Severity Breakdown</h3>
+          <div class="chart-wrapper">
+            <canvas id="severityChart"></canvas>
+          </div>
         </div>
-        <div class="severity-row high">
-          <span>High</span><span id="countHigh">0</span>
-        </div>
-        <div class="severity-row medium">
-          <span>Medium</span><span id="countMedium">0</span>
-        </div>
-        <div class="severity-row low">
-          <span>Low</span><span id="countLow">0</span>
-        </div>
-        <div class="severity-row info">
-          <span>Informational</span><span id="countInfo">0</span>
+        <div class="chart-card">
+          <h3>Vulnerability Types</h3>
+          <div class="chart-wrapper">
+            <canvas id="typeChart"></canvas>
+          </div>
         </div>
       </div>
 

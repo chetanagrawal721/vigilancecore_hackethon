@@ -290,11 +290,10 @@ document.addEventListener("DOMContentLoaded", () => {
       const counts = { critical: 0, high: 0, medium: 0, low: 0, informational: 0 };
       findings.forEach((f) => { const s = cleanSev(f.severity); if (s in counts) counts[s]++; });
 
-      setText("countCritical", counts.critical);
-      setText("countHigh",     counts.high);
-      setText("countMedium",   counts.medium);
-      setText("countLow",      counts.low);
-      setText("countInfo",     counts.informational);
+      // Render Charts
+      if (typeof Chart !== "undefined") {
+        renderCharts(counts, findings);
+      }
 
       const overall = ["critical","high","medium","low","informational"].find((s) => counts[s] > 0) || "none";
       const sevEl   = document.getElementById("resultSeverity");
@@ -395,4 +394,78 @@ document.addEventListener("DOMContentLoaded", () => {
   function cleanSev(r) { return String(r||"informational").replace("Severity.","").toLowerCase().trim(); }
   function cleanType(r){ return String(r||"UNKNOWN").replace("VulnerabilityType.","").replace(/_/g," ").trim(); }
   function extractFilename(p) { return p ? p.split(/[\\/]/).pop() : null; }
+
+  // ── Chart.js Rendering ──────────────────────────────────────────────────
+  let sevChartInstance = null;
+  let typeChartInstance = null;
+
+  function renderCharts(counts, findings) {
+    Chart.defaults.color = '#7a7a96';
+    Chart.defaults.font.family = "'Inter', sans-serif";
+
+    // 1. Severity Chart
+    const sevCtx = document.getElementById('severityChart');
+    if (sevCtx) {
+      if (sevChartInstance) sevChartInstance.destroy();
+      sevChartInstance = new Chart(sevCtx, {
+        type: 'doughnut',
+        data: {
+          labels: ['Critical', 'High', 'Medium', 'Low', 'Info'],
+          datasets: [{
+            data: [counts.critical, counts.high, counts.medium, counts.low, counts.informational],
+            backgroundColor: ['#ff3b3b', '#f97316', '#facc15', '#60a5fa', '#7a7a96'],
+            borderWidth: 0,
+            hoverOffset: 4
+          }]
+        },
+        options: {
+          responsive: true,
+          maintainAspectRatio: false,
+          plugins: {
+            legend: { position: 'right', labels: { boxWidth: 12, padding: 20 } }
+          },
+          cutout: '70%'
+        }
+      });
+    }
+
+    // 2. Vulnerability Types Chart
+    const typeCtx = document.getElementById('typeChart');
+    if (typeCtx) {
+      const typeCounts = {};
+      findings.forEach(f => {
+        const t = String(f.vuln_type || "UNKNOWN").replace("VulnerabilityType.", "");
+        typeCounts[t] = (typeCounts[t] || 0) + 1;
+      });
+
+      const labels = Object.keys(typeCounts);
+      const data = Object.values(typeCounts);
+      
+      const baseColors = ['#7c6aff', '#a78bfa', '#f472b6', '#38bdf8', '#34d399', '#fbbf24', '#f87171', '#818cf8', '#c084fc', '#2dd4bf'];
+      const colors = labels.map((_, i) => baseColors[i % baseColors.length]);
+
+      if (typeChartInstance) typeChartInstance.destroy();
+      typeChartInstance = new Chart(typeCtx, {
+        type: 'doughnut',
+        data: {
+          labels: labels.length ? labels : ['None'],
+          datasets: [{
+            data: data.length ? data : [1],
+            backgroundColor: data.length ? colors : ['#16161f'],
+            borderWidth: 0,
+            hoverOffset: 4
+          }]
+        },
+        options: {
+          responsive: true,
+          maintainAspectRatio: false,
+          plugins: {
+            legend: { position: 'right', labels: { boxWidth: 12, padding: 20 } }
+          },
+          cutout: '70%'
+        }
+      });
+    }
+  }
+
 });
