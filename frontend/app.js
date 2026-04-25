@@ -186,6 +186,25 @@ document.addEventListener("DOMContentLoaded", () => {
     }
 
     // ── Validation ─────────────────────────────────────────────────────────────
+    function looksLikeSolidity(src) {
+      const s = src.toLowerCase();
+
+      // Reject if it contains obvious webpage / HTML artifacts
+      const webpageMarkers = [
+        "skip to content", "<!doctype", "<html", "<head", "<body",
+        "navigation", "footer", "sign in", "sign up", "githubusercontent",
+        "github.com", "<script", "<link rel",
+      ];
+      if (webpageMarkers.some((m) => s.includes(m))) return false;
+
+      // Must contain at least one Solidity top-level keyword
+      return (
+        s.includes("pragma solidity") ||
+        s.includes("pragma experimental") ||
+        /\b(contract|interface|library|abstract)\s+\w+/.test(s)
+      );
+    }
+
     function validateForm() {
       let valid = true;
       const nameField = document.getElementById("contractName");
@@ -200,6 +219,11 @@ document.addEventListener("DOMContentLoaded", () => {
       const hasFile   = fileInput.files && fileInput.files.length > 0;
       const hasCode   = codeField && codeField.value.trim().length > 0;
       if (!hasFile && !hasCode) {
+        codeError.textContent = "Please paste Solidity code or upload a .sol file.";
+        codeError.classList.add("visible"); valid = false;
+      } else if (hasCode && !looksLikeSolidity(codeField.value)) {
+        codeError.textContent =
+          "This doesn\u2019t look like valid Solidity. Make sure you paste the raw .sol source code, not a webpage.";
         codeError.classList.add("visible"); valid = false;
       } else {
         codeError.classList.remove("visible");
@@ -291,6 +315,29 @@ document.addEventListener("DOMContentLoaded", () => {
       if (dlBtn) dlBtn.addEventListener("click", () => {
         window.location.href = `${API_BASE}/api/report/${data.scan_id}/download`;
       });
+
+      // ── AI Assistant ─────────────────────────────────────────────────────────
+      if (typeof VCChat !== "undefined") {
+        VCChat.init(data);
+      }
+
+      // Standalone Download AI Report button (in results-actions bar)
+      const aiDlBtn = document.getElementById("downloadAIReportBtn");
+      if (aiDlBtn && typeof VCAssistant !== "undefined") {
+        aiDlBtn.addEventListener("click", () => {
+          const ai     = new VCAssistant(data);
+          const report = ai.generateFullReport();
+          const blob   = new Blob([report], { type: "text/plain;charset=utf-8" });
+          const url    = URL.createObjectURL(blob);
+          const a      = document.createElement("a");
+          a.href       = url;
+          a.download   = `vigilancecore_ai_report_${data.scan_id || Date.now()}.txt`;
+          document.body.appendChild(a);
+          a.click();
+          document.body.removeChild(a);
+          URL.revokeObjectURL(url);
+        });
+      }
     }
 
     function buildCard(f, num) {
