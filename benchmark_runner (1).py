@@ -70,8 +70,7 @@ logger = logging.getLogger("benchmark_runner")
 # Dataset root paths  (edit if your checkouts live elsewhere)
 # ---------------------------------------------------------------------------
 SMARTBUGS_ROOT = Path("../smartbugs-curated/dataset")
-SOLIDIFI_ROOT  = Path("../SolidiFI-benchmark/buggy_contracts")
-
+SOLIDIFI_ROOT = Path("C:/Users/Chetan/SolidiFI-benchmark/buggy_contracts")
 # ---------------------------------------------------------------------------
 # Category → expected vuln_type value
 #

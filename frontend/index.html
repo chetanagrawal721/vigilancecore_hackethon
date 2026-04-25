@@ -1,0 +1,126 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <meta name="description" content="VigilanceCore — AI-enhanced smart contract security analysis platform." />
+  <title>VigilanceCore | Smart Contract Security Intelligence</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&display=swap" rel="stylesheet">
+  <link rel="stylesheet" href="/frontend/styles.css" />
+</head>
+<body>
+  <div class="noise"></div>
+
+  <header class="container">
+    <nav class="nav">
+      <a class="brand" href="/">
+        <div class="brand-mark" aria-hidden="true"></div>
+        <div>
+          <strong>VigilanceCore</strong>
+          <span>Smart contract security intelligence</span>
+        </div>
+      </a>
+      <div class="nav-links">
+        <a href="#capabilities">Capabilities</a>
+        <a href="#workflow">Workflow</a>
+        <a href="frontend/input" class="cta">Start scan</a>
+      </div>
+    </nav>
+  </header>
+
+  <main class="container">
+    <section class="hero">
+      <div>
+        <div class="eyebrow"><i></i> AI-enhanced smart contract analysis</div>
+        <h1><span class="gradient-text">Security</span> intelligence for Solidity teams.</h1>
+        <p class="lead">
+          VigilanceCore combines static analysis, taint-driven vulnerability detection, and structured reporting
+          to help developers understand risk faster and ship with confidence.
+        </p>
+        <div class="actions">
+          <a href="/input" class="button primary">Analyze a contract</a>
+          <a href="#workflow" class="button secondary">See workflow</a>
+        </div>
+        <div class="stats">
+          <div class="stat">
+            <strong>93.6% accuracy</strong>
+            <span>Benchmarked on SolidiFI — the industry-standard vulnerability dataset.</span>
+          </div>
+          <div class="stat">
+            <strong>11 detectors</strong>
+            <span>Covering reentrancy, access control, arithmetic, delegatecall, and more.</span>
+          </div>
+          <div class="stat">
+            <strong>Structured reports</strong>
+            <span>Clean findings with CVSS scores, SWC references, and remediation guidance.</span>
+          </div>
+        </div>
+      </div>
+
+      <div class="hero-card" aria-label="Security scan preview">
+        <div class="scan-window">
+          <div class="scan-topbar" aria-hidden="true">
+            <span class="dot"></span><span class="dot"></span><span class="dot"></span>
+          </div>
+          <div class="scan-body">
+            <div class="scan-title">
+              <div>
+                <h2>Live analysis pipeline</h2>
+                <p>Scanning Solidity source and preparing structured findings.</p>
+              </div>
+            </div>
+            <div class="progress" aria-hidden="true"></div>
+            <div class="code-panel">
+              <div>Contract: Vault.sol</div>
+              <div>Status: Running static checks</div>
+              <div>Finding: External call before state update</div>
+              <div>Severity: Critical — SWC-107</div>
+              <div>Report: Preparing audit output</div>
+            </div>
+          </div>
+        </div>
+      </div>
+    </section>
+
+    <section id="capabilities">
+      <p class="section-label">Capabilities</p>
+      <div class="feature-grid">
+        <article class="feature">
+          <h3>Deterministic findings</h3>
+          <p>Rule-based and taint-driven detection produces repeatable, auditable output with exact line numbers.</p>
+        </article>
+        <article class="feature">
+          <h3>Structured reporting</h3>
+          <p>Every finding includes severity, CVSS score, SWC reference, description, and a concrete recommendation.</p>
+        </article>
+        <article class="feature">
+          <h3>Production-ready API</h3>
+          <p>FastAPI backend with async scan processing, status polling, and full JSON report download.</p>
+        </article>
+      </div>
+    </section>
+
+    <section id="workflow" style="padding-bottom: 80px;">
+      <p class="section-label">Workflow</p>
+      <div class="feature-grid">
+        <article class="feature">
+          <h3>1. Upload contract</h3>
+          <p>Provide a Solidity file or paste source code directly into the analysis workspace.</p>
+        </article>
+        <article class="feature">
+          <h3>2. Track progress</h3>
+          <p>The backend processes the scan asynchronously while the frontend polls for real-time status.</p>
+        </article>
+        <article class="feature">
+          <h3>3. Review report</h3>
+          <p>Browse structured findings, severity breakdown, and download the full JSON audit report.</p>
+        </article>
+      </div>
+    </section>
+  </main>
+
+  <script src="/frontend/app.js"></script>
+</body>
+</html>

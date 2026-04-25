@@ -1,0 +1,111 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <meta name="description" content="VigilanceCore scan results — findings, severity, and remediation." />
+  <title>VigilanceCore | Scan Results</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&display=swap" rel="stylesheet">
+  <link rel="stylesheet" href="/frontend/styles.css" />
+</head>
+<body>
+  <div class="noise"></div>
+
+  <header class="container">
+    <nav class="nav">
+      <a class="brand" href="/">
+        <div class="brand-mark" aria-hidden="true"></div>
+        <div>
+          <strong>VigilanceCore</strong>
+          <span>Smart contract security intelligence</span>
+        </div>
+      </a>
+      <div class="nav-links">
+        <a href="/">Home</a>
+        <a href="/input" class="cta">New scan</a>
+      </div>
+    </nav>
+  </header>
+
+  <main class="container">
+    <section class="page-hero">
+      <div class="eyebrow"><i></i> Audit report</div>
+      <h1 class="page-title">Security <span class="gradient-text">findings</span> and remediation report.</h1>
+      <p class="lead">A complete breakdown of detected vulnerabilities, severity classification, and recommended fixes.</p>
+    </section>
+
+    <!-- Loading -->
+    <div class="results-loading hidden" id="resultsLoading" aria-live="polite" aria-busy="true">
+      <div class="loader-ring"></div>
+      <p>Retrieving analysis results...</p>
+    </div>
+
+    <!-- Error -->
+    <div class="results-error hidden" id="resultsError" aria-live="assertive">
+      <h2>Results unavailable</h2>
+      <p id="resultsErrorText">This scan may have expired or the scan ID is invalid.</p>
+      <a href="/input" class="button primary" style="margin-top:1.5rem; display:inline-block;">Run new analysis</a>
+    </div>
+
+    <!-- Results shell -->
+    <section class="results-shell hidden" id="resultsShell">
+
+      <div class="summary-grid">
+        <article class="summary-card">
+          <span class="summary-label">Contract</span>
+          <strong id="resultContractName">-</strong>
+          <p>Submitted for analysis</p>
+        </article>
+        <article class="summary-card">
+          <span class="summary-label">Overall severity</span>
+          <strong id="resultSeverity" class="severity-badge">-</strong>
+          <p id="resultSeverityText">-</p>
+        </article>
+        <article class="summary-card">
+          <span class="summary-label">Total findings</span>
+          <strong id="resultTotal">0</strong>
+          <p>Issues detected</p>
+        </article>
+        <article class="summary-card">
+          <span class="summary-label">Scan status</span>
+          <strong id="resultStatus">-</strong>
+          <p id="resultStatusText">-</p>
+        </article>
+      </div>
+
+      <div class="severity-breakdown">
+        <div class="severity-row critical">
+          <span>Critical</span><span id="countCritical">0</span>
+        </div>
+        <div class="severity-row high">
+          <span>High</span><span id="countHigh">0</span>
+        </div>
+        <div class="severity-row medium">
+          <span>Medium</span><span id="countMedium">0</span>
+        </div>
+        <div class="severity-row low">
+          <span>Low</span><span id="countLow">0</span>
+        </div>
+        <div class="severity-row info">
+          <span>Informational</span><span id="countInfo">0</span>
+        </div>
+      </div>
+
+      <div class="findings-section">
+        <h2 class="findings-heading">Detailed findings</h2>
+        <div class="findings-list" id="findingsList"></div>
+      </div>
+
+      <div class="results-actions">
+        <button class="button primary" id="downloadReportBtn">Download full report</button>
+        <a href="/input" class="button secondary">Run another scan</a>
+      </div>
+
+    </section>
+  </main>
+
+  <script src="/frontend/app.js"></script>
+</body>
+</html>
