@@ -1,0 +1,11 @@
+# Core static analysis engine
+slither-analyzer>=0.10.0
+
+# solc version management (called via subprocess in slither_wrapper.py)
+solc-select>=1.0.4
+
+# Keccak selector computation (contract_parser.py, primary attempt)
+eth-hash[pysha3]>=0.5.2
+
+# Keccak selector computation (contract_parser.py, fallback attempt)
+eth-utils>=2.3.0

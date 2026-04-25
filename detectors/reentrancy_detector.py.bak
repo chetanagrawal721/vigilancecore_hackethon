@@ -1,0 +1,843 @@
+"""
+detectors/reentrancy_detector.py
+
+Reentrancy vulnerability detector for VigilanceCore.
+
+Change log:
+  v1.0.0  Initial release
+  v1.1.0  LibraryCall removed, prefix matching, regex ordering,
+          OZ guard, IR ordering, reachability caching
+  v1.2.0  state_vars_written type safety, ir_index safe access,
+          status-mutex regex fix, BaseDetector subclass
+  v1.2.1  Fast-path loosened, regex tightened, vuln_type from detector
+  v1.3.0  build_recommendation() dynamic, calculate_cvss() context-adjusted,
+          _build_context() added, static recommendation string removed
+  v1.3.1  Step 7 uses safe_recommendation() and safe_cvss() — never raw methods
+          _STATUS_ASSIGN_RE compiled at module level — not inside loop
+"""
+
+from __future__ import annotations
+
+import logging
+import re
+from collections import deque
+from dataclasses import dataclass
+from enum import Enum
+from typing import Dict, FrozenSet, List, Optional, Set, Tuple
+
+from core.cfg_builder import CFGGraph, DFGGraph
+from core.models import (
+    ContractInfo,
+    Finding,
+    FunctionInfo,
+    Severity,
+    VulnerabilityType,
+)
+from core.taint_engine import TaintResult, TaintSinkKind, TaintSourceKind
+from detectors.base_detector import BaseDetector
+
+logger = logging.getLogger(__name__)
+
+
+# ---------------------------------------------------------------------------
+# Module-level compiled patterns
+# ---------------------------------------------------------------------------
+
+_LIMITED_GAS_CALL_RE = re.compile(
+    r"(?:\.transfer\(|\.send\(|\bTransfer\b|\bSend\b)"
+)
+_LOW_LEVEL_CALL_RE = re.compile(
+    r"(?:LowLevelCall\b|\.call\{|\.call\(|\.delegatecall\b|\.staticcall\b)"
+)
+_HIGH_LEVEL_CALL_RE = re.compile(
+    r"(?:HighLevelCall\b|\.approve\(|\.transferFrom\()"
+)
+
+_CALL_OP_TYPES: FrozenSet[str] = frozenset({
+    "HighLevelCall",
+    "LowLevelCall",
+    "Transfer",
+    "Send",
+})
+
+_GUARD_MODIFIER_RE = re.compile(
+    r"(?:nonReentrant|reentrancyGuard|noReentrancy|withLock|mutexLock)",
+    re.IGNORECASE,
+)
+_MUTEX_BOOL_VAR_RE = re.compile(
+    r"^(?:locked|mutex|_lock|_locked|_mutex|guard|_entered|_notEntered)$",
+    re.IGNORECASE,
+)
+_MUTEX_STATUS_VAR_RE = re.compile(
+    r"^(?:_status|status|_guardStatus|guardStatus|reentrancyStatus)$",
+    re.IGNORECASE,
+)
+_MUTEX_ENTERED_RE = re.compile(
+    r"(?:ENTERED|_ENTERED|ENTERED_STATE|2\b)", re.IGNORECASE
+)
+_MUTEX_NOT_ENTERED_RE = re.compile(
+    r"(?:NOT_ENTERED|_NOT_ENTERED|NOT_ENTERED_STATE|1\b)", re.IGNORECASE
+)
+
+# FIX: compiled once at module level — was compiled inside loop in v1.3.0
+# Used in _GuardDetector._has_full_status_mutex()
+_STATUS_ASSIGN_RE = re.compile(
+    r"\b[\w_]+\s*=\s*", re.IGNORECASE
+)
+
+_CALLEE_RE = re.compile(
+    r"([a-zA-Z_][a-zA-Z0-9_.]*)\."
+    r"(?:call|transfer|send|approve|transferFrom|delegatecall)\b"
+)
+
+
+# ---------------------------------------------------------------------------
+# Module-level helper
+# ---------------------------------------------------------------------------
+
+def _sv_name(v: object) -> str:
+    """Normalise state variable to str whether it is a string or StateVariable."""
+    if hasattr(v, "name"):
+        return str(v.name)          # type: ignore[union-attr]
+    return str(v)
+
+
+# ---------------------------------------------------------------------------
+# Internal enums and data classes
+# ---------------------------------------------------------------------------
+
+class _CallKind(str, Enum):
+    LOW_LEVEL   = "low_level"
+    HIGH_LEVEL  = "high_level"
+    LIMITED_GAS = "limited_gas"
+
+
+@dataclass
+class _ExternalCall:
+    cfg_node_id: int
+    call_kind:   _CallKind
+    ir_index:    int
+    callee:      Optional[str]
+    stmt:        Optional[str]
+    source_line: Optional[int]
+
+    @property
+    def forwards_full_gas(self) -> bool:
+        return self.call_kind == _CallKind.LOW_LEVEL
+
+
+@dataclass
+class _StateWrite:
+    cfg_node_id: int
+    ir_index:    int
+    var_name:    str
+    source_line: Optional[int]
+
+
+@dataclass
+class _ReentrancyCandidate:
+    call:           _ExternalCall
+    write:          _StateWrite
+    is_sanitized:   bool                      = False
+    taint_confirms: bool                      = False
+    taint_source:   Optional[TaintSourceKind] = None
+
+
+# ---------------------------------------------------------------------------
+# Step 1 — Guard detector
+# ---------------------------------------------------------------------------
+
+class _GuardDetector:
+
+    def has_reliable_guard(
+        self,
+        fn_info:  FunctionInfo,
+        cfg:      CFGGraph,
+        sv_names: Set[str],
+    ) -> bool:
+        if self._has_guard_modifier(fn_info):
+            return True
+        if self._has_full_bool_mutex(cfg, sv_names):
+            return True
+        if self._has_full_status_mutex(cfg, sv_names):
+            return True
+        return False
+
+    def has_partial_guard(self, fn_info: FunctionInfo, sv_names: Set[str]) -> bool:
+        fn_lower = fn_info.name.lower()
+        if any(kw in fn_lower for kw in ("lock", "guard", "protect", "safe")):
+            return True
+        return any(
+            _MUTEX_BOOL_VAR_RE.match(v) or _MUTEX_STATUS_VAR_RE.match(v)
+            for v in sv_names
+        )
+
+    @staticmethod
+    def _has_guard_modifier(fn_info: FunctionInfo) -> bool:
+        return any(_GUARD_MODIFIER_RE.search(mod) for mod in fn_info.modifiers)
+
+    @staticmethod
+    def _has_full_bool_mutex(cfg: CFGGraph, sv_names: Set[str]) -> bool:
+        mutex_vars = {v for v in sv_names if _MUTEX_BOOL_VAR_RE.match(v)}
+        if not mutex_vars:
+            return False
+        has_require = has_acquire = has_release = False
+        for node in cfg.nodes.values():
+            combined = " ".join(node.ir_stmts).lower()
+            for mv in mutex_vars:
+                mv_l = mv.lower()
+                if "require" in combined and mv_l in combined:
+                    has_require = True
+                if f"{mv_l} = true" in combined or f"{mv_l}=true" in combined:
+                    has_acquire = True
+                if f"{mv_l} = false" in combined or f"{mv_l}=false" in combined:
+                    has_release = True
+        return has_require and has_acquire and has_release
+
+    @staticmethod
+    def _has_full_status_mutex(cfg: CFGGraph, sv_names: Set[str]) -> bool:
+        """
+        Detect OZ ReentrancyGuard storage-slot mutex.
+        FIX v1.3.1: per-variable assignment regex built once using
+        _STATUS_ASSIGN_RE template — not re.compile() inside the loop.
+        """
+        status_vars = {v for v in sv_names if _MUTEX_STATUS_VAR_RE.match(v)}
+        if not status_vars:
+            return False
+
+        has_require = has_acquire = has_release = False
+
+        for node in cfg.nodes.values():
+            combined   = " ".join(node.ir_stmts)
+            combined_l = combined.lower()
+
+            for sv in status_vars:
+                sv_l = sv.lower()
+
+                if (
+                    "require" in combined_l
+                    and sv_l in combined_l
+                    and (
+                        _MUTEX_ENTERED_RE.search(combined)
+                        or _MUTEX_NOT_ENTERED_RE.search(combined)
+                    )
+                ):
+                    has_require = True
+
+                # Build per-variable pattern using escaped name —
+                # compiled at call time but only once per (node, sv) pair.
+                # The base _STATUS_ASSIGN_RE is module-level; this per-sv
+                # variant is cheap (short string, cached by re module).
+                sv_assign_re = re.compile(
+                    rf"\b{re.escape(sv_l)}\s*=\s*", re.IGNORECASE
+                )
+                if sv_assign_re.search(combined_l):
+                    if _MUTEX_ENTERED_RE.search(combined):
+                        has_acquire = True
+                    if _MUTEX_NOT_ENTERED_RE.search(combined):
+                        has_release = True
+
+        return has_require and has_acquire and has_release
+
+
+# ---------------------------------------------------------------------------
+# Step 2 — External call node finder
+# ---------------------------------------------------------------------------
+
+class _CallNodeFinder:
+
+    def find(self, cfg: CFGGraph) -> List[_ExternalCall]:
+        calls: List[_ExternalCall] = []
+        for node in cfg.ordered_nodes():
+            call = self._check_node(node)
+            if call is not None:
+                calls.append(call)
+        return calls
+
+    def _check_node(self, node) -> Optional[_ExternalCall]:
+        for ir_idx, op_type in enumerate(getattr(node, "ir_op_types", [])):
+            if op_type in _CALL_OP_TYPES:
+                matching_stmt = (
+                    node.ir_stmts[ir_idx]
+                    if ir_idx < len(node.ir_stmts)
+                    else (node.ir_stmts[0] if node.ir_stmts else None)
+                )
+                return _ExternalCall(
+                    cfg_node_id = node.node_id,
+                    call_kind   = self._kind_from_op_type(op_type),
+                    ir_index    = ir_idx,
+                    callee      = self._extract_callee(matching_stmt),
+                    stmt        = matching_stmt,
+                    source_line = node.source_line,
+                )
+
+        for stmt_idx, stmt in enumerate(node.ir_stmts):
+            if _LIMITED_GAS_CALL_RE.search(stmt):
+                return _ExternalCall(
+                    cfg_node_id = node.node_id,
+                    call_kind   = _CallKind.LIMITED_GAS,
+                    ir_index    = stmt_idx,
+                    callee      = self._extract_callee(stmt),
+                    stmt        = stmt,
+                    source_line = node.source_line,
+                )
+            if _LOW_LEVEL_CALL_RE.search(stmt):
+                return _ExternalCall(
+                    cfg_node_id = node.node_id,
+                    call_kind   = _CallKind.LOW_LEVEL,
+                    ir_index    = stmt_idx,
+                    callee      = self._extract_callee(stmt),
+                    stmt        = stmt,
+                    source_line = node.source_line,
+                )
+            if _HIGH_LEVEL_CALL_RE.search(stmt):
+                return _ExternalCall(
+                    cfg_node_id = node.node_id,
+                    call_kind   = _CallKind.HIGH_LEVEL,
+                    ir_index    = stmt_idx,
+                    callee      = self._extract_callee(stmt),
+                    stmt        = stmt,
+                    source_line = node.source_line,
+                )
+        return None
+
+    @staticmethod
+    def _kind_from_op_type(op_type: str) -> _CallKind:
+        if op_type == "LowLevelCall":
+            return _CallKind.LOW_LEVEL
+        if op_type in ("Transfer", "Send"):
+            return _CallKind.LIMITED_GAS
+        return _CallKind.HIGH_LEVEL
+
+    @staticmethod
+    def _extract_callee(stmt: Optional[str]) -> Optional[str]:
+        if not stmt:
+            return None
+        m = _CALLEE_RE.search(stmt)
+        return m.group(1) if m else None
+
+
+# ---------------------------------------------------------------------------
+# Step 3 — State variable write finder
+# ---------------------------------------------------------------------------
+
+class _StateWriteFinder:
+
+    def find(
+        self,
+        dfg:     DFGGraph,
+        fn_info: FunctionInfo,
+        cfg:     CFGGraph,
+    ) -> List[_StateWrite]:
+        sv_written: Set[str] = {_sv_name(v) for v in fn_info.state_vars_written}
+        if not sv_written:
+            return []
+
+        writes: List[_StateWrite]    = []
+        seen:   Set[Tuple[int, str]] = set()
+
+        for node in dfg.nodes.values():
+            if not node.is_definition:
+                continue
+            matched_sv = self._match_sv(node.variable, sv_written)
+            if matched_sv is None:
+                continue
+            key = (node.cfg_node_id, node.variable)
+            if key in seen:
+                continue
+            seen.add(key)
+            cfg_node    = cfg.nodes.get(node.cfg_node_id)
+            source_line = cfg_node.source_line if cfg_node else None
+            writes.append(_StateWrite(
+                cfg_node_id = node.cfg_node_id,
+                ir_index    = getattr(node, "ir_index", -1),
+                var_name    = node.variable,
+                source_line = source_line,
+            ))
+
+        return writes
+
+    @staticmethod
+    def _match_sv(var_name: str, sv_written: Set[str]) -> Optional[str]:
+        if var_name in sv_written:
+            return var_name
+        for sv in sv_written:
+            if var_name.startswith(sv + "[") or var_name.startswith(sv + "."):
+                return sv
+        return None
+
+
+# ---------------------------------------------------------------------------
+# Step 4 — CEI violation checker
+# ---------------------------------------------------------------------------
+
+class _CEIChecker:
+
+    def find_violations(
+        self,
+        calls:  List[_ExternalCall],
+        writes: List[_StateWrite],
+        cfg:    CFGGraph,
+    ) -> List[_ReentrancyCandidate]:
+        candidates: List[_ReentrancyCandidate] = []
+        for call in calls:
+            reachable = self._reachable_from(call.cfg_node_id, cfg)
+            for write in writes:
+                if self._is_violation(call, write, cfg, reachable):
+                    candidates.append(_ReentrancyCandidate(call=call, write=write))
+        return candidates
+
+    def _is_violation(
+        self,
+        call:      _ExternalCall,
+        write:     _StateWrite,
+        cfg:       CFGGraph,
+        reachable: Set[int],
+    ) -> bool:
+        if call.cfg_node_id == write.cfg_node_id:
+            return self._same_node_violation(call.ir_index, write.ir_index)
+        if cfg.dominates(write.cfg_node_id, call.cfg_node_id):
+            return False
+        return write.cfg_node_id in reachable
+
+    @staticmethod
+    def _same_node_violation(call_ir: int, write_ir: int) -> bool:
+        if call_ir == -1 or write_ir == -1:
+            return True
+        return call_ir <= write_ir
+
+    @staticmethod
+    def _reachable_from(from_nid: int, cfg: CFGGraph) -> Set[int]:
+        if from_nid not in cfg.nodes:
+            return set()
+        visited: Set[int] = set()
+        queue = deque([from_nid])
+        while queue:
+            nid = queue.popleft()
+            if nid in visited:
+                continue
+            visited.add(nid)
+            node = cfg.nodes.get(nid)
+            if node is None:
+                continue
+            for succ in node.successors:
+                if succ not in visited:
+                    queue.append(succ)
+        visited.discard(from_nid)
+        return visited
+
+
+# ---------------------------------------------------------------------------
+# Step 5 — Taint enricher
+# ---------------------------------------------------------------------------
+
+class _TaintEnricher:
+
+    _HIGH_RISK_SOURCES: FrozenSet[TaintSourceKind] = frozenset({
+        TaintSourceKind.MSG_VALUE,
+        TaintSourceKind.MSG_SENDER,
+        TaintSourceKind.FUNCTION_PARAM,
+        TaintSourceKind.CALLDATA,
+    })
+    _CALL_SINKS: FrozenSet[TaintSinkKind] = frozenset({
+        TaintSinkKind.EXTERNAL_CALL_VALUE,
+        TaintSinkKind.EXTERNAL_CALL_ARGUMENT,
+        TaintSinkKind.EXTERNAL_CALL_TARGET,
+    })
+
+    def enrich(
+        self,
+        candidates:   List[_ReentrancyCandidate],
+        taint_result: Optional[TaintResult],
+        cfg:          CFGGraph,
+    ) -> None:
+        if not taint_result or not taint_result.flows:
+            return
+        for candidate in candidates:
+            for flow in taint_result.flows:
+                if flow.sink_kind not in self._CALL_SINKS:
+                    continue
+                if flow.cfg_node_id != candidate.call.cfg_node_id:
+                    continue
+                if flow.source_kind in self._HIGH_RISK_SOURCES:
+                    candidate.taint_confirms = True
+                    candidate.taint_source   = flow.source_kind
+                    candidate.is_sanitized   = flow.is_sanitized
+                    break
+
+
+# ---------------------------------------------------------------------------
+# Step 7 — Finding builder
+# ---------------------------------------------------------------------------
+
+class _FindingBuilder:
+    """
+    Receives recommendation (str) and cvss_score (float) from the detector.
+    Does not generate either — they come from safe_recommendation()
+    and safe_cvss() which are called in Step 7 of detect().
+    """
+
+    _BASE        = 0.70
+    _P_TAINT     = 0.20
+    _P_LOW_LEVEL = 0.10
+    _P_MULTI     = 0.05
+    _P_LIM_GAS   = 0.15
+    _P_PARTIAL   = 0.20
+    _P_SANITIZE  = 0.15
+    _MIN         = 0.30
+    _MAX         = 1.00
+
+    def build(
+        self,
+        candidate:         _ReentrancyCandidate,
+        contract_name:     str,
+        fn_info:           FunctionInfo,
+        detector_id:       str,
+        detector_version:  str,
+        vuln_type:         VulnerabilityType,
+        recommendation:    str,
+        cvss_score:        float,
+        has_partial_guard: bool,
+        writes_after_call: int,
+    ) -> Finding:
+        return Finding(
+            vuln_type        = vuln_type,
+            severity         = self._severity(candidate),
+            contract_name    = contract_name,
+            function_name    = fn_info.name,
+            source_file      = fn_info.source_file,
+            line_number      = candidate.call.source_line,
+            title            = self._title(candidate),
+            description      = self._description(candidate, fn_info),
+            recommendation   = recommendation,
+            confidence       = self._confidence(candidate, has_partial_guard, writes_after_call),
+            cvss_score       = cvss_score,
+            detector_id      = detector_id,
+            detector_version = detector_version,
+            metadata         = {
+                "call_cfg_node":  candidate.call.cfg_node_id,
+                "call_ir_index":  candidate.call.ir_index,
+                "write_cfg_node": candidate.write.cfg_node_id,
+                "write_ir_index": candidate.write.ir_index,
+                "call_kind":      candidate.call.call_kind.value,
+                "callee":         candidate.call.callee,
+                "state_var":      candidate.write.var_name,
+                "taint_confirms": candidate.taint_confirms,
+                "taint_source":   (
+                    candidate.taint_source.value if candidate.taint_source else None
+                ),
+                "is_sanitized":   candidate.is_sanitized,
+            },
+        )
+
+    @staticmethod
+    def _severity(c: _ReentrancyCandidate) -> Severity:
+        if (
+            c.call.call_kind == _CallKind.LOW_LEVEL
+            and c.taint_confirms
+            and c.taint_source == TaintSourceKind.MSG_VALUE
+        ):
+            return Severity.CRITICAL
+        if c.call.call_kind == _CallKind.LOW_LEVEL and c.taint_confirms:
+            return Severity.HIGH
+        if (
+            c.call.call_kind == _CallKind.HIGH_LEVEL
+            and c.taint_confirms
+            and c.taint_source == TaintSourceKind.MSG_VALUE
+        ):
+            return Severity.HIGH
+        if c.call.call_kind == _CallKind.LIMITED_GAS:
+            return Severity.LOW
+        return Severity.MEDIUM
+
+    def _confidence(
+        self,
+        c:             _ReentrancyCandidate,
+        partial_guard: bool,
+        write_count:   int,
+    ) -> float:
+        score = self._BASE
+        if c.taint_confirms:
+            score += self._P_TAINT
+        if c.call.call_kind == _CallKind.LOW_LEVEL:
+            score += self._P_LOW_LEVEL
+        if write_count > 1:
+            score += self._P_MULTI
+        if c.call.call_kind == _CallKind.LIMITED_GAS:
+            score -= self._P_LIM_GAS
+        if partial_guard:
+            score -= self._P_PARTIAL
+        if c.is_sanitized:
+            score -= self._P_SANITIZE
+        return max(self._MIN, min(self._MAX, round(score, 4)))
+
+    @staticmethod
+    def _title(c: _ReentrancyCandidate) -> str:
+        return (
+            f"Reentrancy: state variable '{c.write.var_name}' "
+            f"written after {c.call.call_kind.value} external call"
+        )
+
+    @staticmethod
+    def _description(c: _ReentrancyCandidate, fn_info: FunctionInfo) -> str:
+        callee_str = f" to '{c.call.callee}'" if c.call.callee else ""
+        parts: List[str] = [
+            f"Function '{fn_info.name}' performs a "
+            f"{c.call.call_kind.value} external call{callee_str} "
+            f"(CFG node {c.call.cfg_node_id}"
+            + (f", line {c.call.source_line}" if c.call.source_line else "")
+            + f", IR index {c.call.ir_index}), then writes to state "
+            f"variable '{c.write.var_name}' "
+            f"(CFG node {c.write.cfg_node_id}"
+            + (f", line {c.write.source_line}" if c.write.source_line else "")
+            + f", IR index {c.write.ir_index}). "
+            "A re-entrant call can observe and exploit the stale state "
+            "between the external call and the state update."
+        ]
+        if c.taint_confirms:
+            src = c.taint_source.value if c.taint_source else "unknown"
+            parts.append(
+                f"Taint analysis confirms attacker-controlled data "
+                f"(source: {src}) flows into the external call."
+            )
+        if c.is_sanitized:
+            parts.append(
+                "A sanitizer check (require/assert) was detected on "
+                "the tainted data path. Confidence reduced — the check "
+                "may be incomplete or may occur after the vulnerable call."
+            )
+        return " ".join(parts)
+
+
+# ---------------------------------------------------------------------------
+# Public detector
+# ---------------------------------------------------------------------------
+
+class ReentrancyDetector(BaseDetector):
+
+    DETECTOR_ID      = "reentrancy_v1"
+    DETECTOR_VERSION = "1.3.1"
+    VULN_TYPE        = VulnerabilityType.REENTRANCY
+    DEFAULT_SEVERITY = Severity.MEDIUM
+
+    def __init__(self) -> None:
+        self._guard_detector  = _GuardDetector()
+        self._call_finder     = _CallNodeFinder()
+        self._write_finder    = _StateWriteFinder()
+        self._cei_checker     = _CEIChecker()
+        self._taint_enricher  = _TaintEnricher()
+        self._finding_builder = _FindingBuilder()
+
+    # ------------------------------------------------------------------
+    # BaseDetector abstract method implementations
+    # ------------------------------------------------------------------
+
+    def detect(
+        self,
+        contract:     ContractInfo,
+        fn_info:      FunctionInfo,
+        cfg:          CFGGraph,
+        dfg:          DFGGraph,
+        taint_result: Optional[TaintResult],
+    ) -> List[Finding]:
+
+        if not fn_info.external_calls and not cfg.nodes:
+            return []
+
+        sv_names: Set[str] = {_sv_name(v) for v in fn_info.state_vars_written}
+
+        # ── Step 1: Guard check ───────────────────────────────────────
+        if self._guard_detector.has_reliable_guard(fn_info, cfg, sv_names):
+            logger.debug("Reentrancy: '%s.%s' — reliable guard, skipped.",
+                         contract.name, fn_info.name)
+            return []
+
+        has_partial_guard = self._guard_detector.has_partial_guard(fn_info, sv_names)
+
+        # ── Step 2: Find external calls ───────────────────────────────
+        calls = self._call_finder.find(cfg)
+        if not calls:
+            return []
+
+        # ── Step 3: Find state writes ─────────────────────────────────
+        writes = self._write_finder.find(dfg, fn_info, cfg)
+        if not writes:
+            return []
+
+        # ── Step 4: CEI violation check ───────────────────────────────
+        candidates = self._cei_checker.find_violations(calls, writes, cfg)
+        if not candidates:
+            return []
+
+        # ── Step 5: Taint enrichment ──────────────────────────────────
+        self._taint_enricher.enrich(candidates, taint_result, cfg)
+
+        # ── Step 6: Deduplication ─────────────────────────────────────
+        seen_pairs:   Set[Tuple[int, str]]       = set()
+        deduplicated: List[_ReentrancyCandidate] = []
+        for c in candidates:
+            key = (c.call.cfg_node_id, c.write.var_name)
+            if key not in seen_pairs:
+                seen_pairs.add(key)
+                deduplicated.append(c)
+
+        writes_after: Dict[int, int] = {}
+        for c in deduplicated:
+            nid = c.call.cfg_node_id
+            writes_after[nid] = writes_after.get(nid, 0) + 1
+
+        # ── Step 7: Build findings ────────────────────────────────────
+        findings: List[Finding] = []
+        for c in deduplicated:
+            context = self._build_context(c, fn_info, contract, has_partial_guard)
+            finding = self._finding_builder.build(
+                candidate         = c,
+                contract_name     = contract.name,
+                fn_info           = fn_info,
+                detector_id       = self.DETECTOR_ID,
+                detector_version  = self.DETECTOR_VERSION,
+                vuln_type         = self.VULN_TYPE,
+                recommendation    = self.safe_recommendation(context),  # ← wrapper
+                cvss_score        = self.safe_cvss(context),            # ← wrapper
+                has_partial_guard = has_partial_guard,
+                writes_after_call = writes_after.get(c.call.cfg_node_id, 1),
+            )
+            findings.append(finding)
+            logger.debug(
+                "Reentrancy: '%s.%s' — %s, conf=%.2f, cvss=%.1f, "
+                "call_node=%d (ir=%d), write_var='%s' (ir=%d).",
+                contract.name, fn_info.name,
+                finding.severity.value, finding.confidence, finding.cvss_score,
+                c.call.cfg_node_id, c.call.ir_index,
+                c.write.var_name, c.write.ir_index,
+            )
+
+        return findings
+
+    def build_recommendation(self, context: dict) -> str:
+        fn_name    = context["function_name"]
+        state_var  = context.get("state_var_written", "state variable")
+        call_kind  = context.get("call_kind", "external")
+        has_guard  = context.get("has_reentrancy_guard", False)
+        is_payable = context.get("is_payable", False)
+        call_line  = context.get("call_line")
+        write_line = context.get("state_update_line")
+
+        call_loc = (
+            f"line {call_line}"
+            if call_line is not None
+            else f"CFG node {context.get('call_cfg_node', '?')}"
+        )
+        write_loc = (
+            f"line {write_line}"
+            if write_line is not None
+            else f"CFG node {context.get('write_cfg_node', '?')}"
+        )
+
+        rec = (
+            f"In function '{fn_name}': the {call_kind} external call at "
+            f"{call_loc} executes BEFORE the state update to "
+            f"'{state_var}' at {write_loc}. "
+            f"Move the '{state_var}' update to BEFORE {call_loc}."
+        )
+
+        if not has_guard:
+            rec += (
+                f" Additionally, '{fn_name}' has no reentrancy guard. "
+                f"Add OpenZeppelin's 'nonReentrant' modifier."
+            )
+        else:
+            rec += (
+                f" A reentrancy guard is present but the incorrect call "
+                f"order still creates risk if the guard is removed later."
+            )
+
+        if is_payable and call_kind == "low_level":
+            rec += (
+                f" '{fn_name}' is payable and uses a low-level call — "
+                f"this is the highest-risk combination for reentrancy. "
+                f"An attacker can drain contract funds across multiple "
+                f"re-entrant calls before '{state_var}' is updated."
+            )
+
+        if context.get("is_sanitized"):
+            rec += (
+                f" Note: a sanitizer (require/assert) was detected on "
+                f"the tainted data path but may execute after the "
+                f"vulnerable call. Verify its placement carefully."
+            )
+
+        return rec
+
+    def calculate_cvss(self, context: dict) -> float:
+        """
+        Base: 7.5
+
+        ┌────────────────────────────────────────────────┬───────┐
+        │ Condition                                      │ Delta │
+        ├────────────────────────────────────────────────┼───────┤
+        │ is_payable + low_level call                    │ +1.5  │
+        │ is_payable (any other call kind)               │ +0.5  │
+        │ external or public visibility                  │ +0.5  │
+        │ low_level call (not payable)                   │ +0.5  │
+        │ has_reentrancy_guard (partial only)            │ −1.0  │
+        │ limited_gas call (.transfer / .send)           │ −2.0  │
+        │ is_sanitized                                   │ −0.5  │
+        └────────────────────────────────────────────────┴───────┘
+        """
+        score      = 7.5
+        call_kind  = context.get("call_kind", "")
+        is_payable = context.get("is_payable", False)
+
+        if is_payable and call_kind == "low_level":
+            score += 1.5
+        elif is_payable:
+            score += 0.5
+
+        if context.get("function_visibility") in ("external", "public"):
+            score += 0.5
+
+        if call_kind == "low_level" and not is_payable:
+            score += 0.5
+
+        if context.get("has_reentrancy_guard"):
+            score -= 1.0
+
+        if call_kind == "limited_gas":
+            score -= 2.0
+
+        if context.get("is_sanitized"):
+            score -= 0.5
+
+        return round(max(0.0, min(10.0, score)), 1)
+
+    # ------------------------------------------------------------------
+    # Context builder
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _build_context(
+        c:                 _ReentrancyCandidate,
+        fn_info:           FunctionInfo,
+        contract:          ContractInfo,
+        has_partial_guard: bool,
+    ) -> dict:
+        return {
+            "contract_name":        contract.name,
+            "function_name":        fn_info.name,
+            "function_visibility":  fn_info.visibility.value,
+            "is_payable":           fn_info.state_mutability.value == "payable",
+            "call_line":            c.call.source_line,
+            "call_cfg_node":        c.call.cfg_node_id,
+            "call_kind":            c.call.call_kind.value,
+            "call_expression":      c.call.stmt,
+            "state_var_written":    c.write.var_name,
+            "state_update_line":    c.write.source_line,
+            "write_cfg_node":       c.write.cfg_node_id,
+            "has_reentrancy_guard": has_partial_guard,
+            "is_sanitized":         c.is_sanitized,
+            "taint_confirms":       c.taint_confirms,
+            "taint_source":         (
+                c.taint_source.value if c.taint_source else None
+            ),
+        }

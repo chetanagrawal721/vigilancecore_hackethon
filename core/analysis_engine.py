@@ -1,0 +1,527 @@
+"""
+core/analysis_engine.py
+
+Orchestrator for the VigilanceCore static-analysis pipeline.
+
+Pipeline (per contract, per function):
+.sol file -> SlitherWrapper -> run Slither
+-> ContractParser -> parse Solidity source into ContractInfo list
+-> CFGAnalyser -> build CFGGraph + DFGGraph per function
+-> TaintEngine -> run taint analysis, produce TaintResult
+-> Detectors -> run every registered detector
+-> AnalysisResult (findings + contracts + stats + source_file)
+"""
+
+from __future__ import annotations
+
+import logging
+import time
+from dataclasses import dataclass, field
+from importlib import import_module
+from typing import Dict, List, Optional, Tuple
+
+from core.cfg_builder import CFGAnalyser, CFGAnalysisResult, CFGGraph, DFGGraph
+from core.contract_parser import ContractParser
+from core.models import (
+    AnalysisResult,
+    ContractInfo,
+    Finding,
+    FunctionInfo,
+    ScanStats,
+)
+from core.slither_wrapper import SlitherWrapper
+from core.taint_engine import TaintEngine, TaintResult
+from detectors.base_detector import BaseDetector
+
+logger = logging.getLogger(__name__)
+
+_ENGINE_VERSION = "1.3.0"
+
+
+@dataclass
+class _FunctionAnalysis:
+    fn_info: FunctionInfo
+    cfg: Optional[CFGGraph] = None
+    dfg: Optional[DFGGraph] = None
+    taint_result: Optional[TaintResult] = None
+    findings: List[Finding] = field(default_factory=list)
+    error: Optional[str] = None
+    duration_ms: int = 0
+    detectors_attempted: int = 0
+    detectors_successful: int = 0
+    was_skipped: bool = False
+
+
+# ---------------------------------------------------------------------------
+# FIX v1.3.1: Corrected module paths and class names.
+#
+#   OLD (broken)                              NEW (correct)
+#   ----------------------------------------  -------------------------
+#   detectors.timestamp_detector_v2          detectors.timestamp_detector
+#   TimestampDetectorV2                      TimestampDetector
+#   detectors.arithmetic_detector_v2         detectors.arithmetic_detector
+#   ArithmeticDetectorV2                     ArithmeticDetector
+#   DoSDetector                              DosDetector
+#   detectors.logic_error_detector           REMOVED — requires spacy;
+#                                            add manually if spacy works
+# ---------------------------------------------------------------------------
+_DEFAULT_DETECTOR_SPECS: List[Tuple[str, str]] = [
+    ("detectors.reentrancy_detector",       "ReentrancyDetector"),
+    ("detectors.access_control_detector",   "AccessControlDetector"),
+    ("detectors.txorigin_detector",         "TxOriginDetector"),
+    ("detectors.timestamp_detector",        "TimestampDetector"),       # FIX: was timestamp_detector_v2 / TimestampDetectorV2
+    ("detectors.unchecked_return_detector", "UncheckedReturnDetector"),
+    ("detectors.randomness_detector",       "RandomnessDetector"),
+    ("detectors.dos_detector",              "DosDetector"),             # FIX: was DoSDetector
+    ("detectors.arithmetic_detector",       "ArithmeticDetector"),      # FIX: was arithmetic_detector_v2 / ArithmeticDetectorV2
+    ("detectors.delegatecall_detector",     "DelegatecallDetector"),
+    ("detectors.business_logic",            "BusinessLogicDetector"),
+    # logic_error_detector intentionally omitted from defaults:
+    # it imports spacy at module level; if spacy is installed and working,
+    # register it manually after engine init:
+    #   from detectors.logic_error_detector import LogicErrorDetector
+    #   engine.register(LogicErrorDetector())
+]
+
+_STATELESS_DETECTOR_IDS = {
+    "txorigin_v1",
+    "timestamp_v1",
+    "randomness_v1",
+    "arithmetic_v1",
+}
+
+_STATELESS_DETECTOR_CLASSES = {
+    "TxOriginDetector",
+    "TimestampDetector",        # FIX: was TimestampDetectorV2
+    "RandomnessDetector",
+    "ArithmeticDetector",       # FIX: was ArithmeticDetectorV2
+}
+
+
+def _build_default_detectors() -> List[BaseDetector]:
+    detectors: List[BaseDetector] = []
+    seen_ids: set[str] = set()
+
+    for module_name, class_name in _DEFAULT_DETECTOR_SPECS:
+        try:
+            module = import_module(module_name)
+            detector_cls = getattr(module, class_name)
+            detector = detector_cls()
+
+            if not isinstance(detector, BaseDetector):
+                raise TypeError(
+                    f"{module_name}.{class_name} is not a BaseDetector instance."
+                )
+
+            detector_id = getattr(detector, "DETECTOR_ID", None)
+            if not detector_id:
+                raise TypeError(
+                    f"{module_name}.{class_name} has no valid DETECTOR_ID."
+                )
+
+            if detector_id in seen_ids:
+                logger.warning(
+                    "Skipping duplicate detector registration: %s (%s.%s)",
+                    detector_id, module_name, class_name,
+                )
+                continue
+
+            detectors.append(detector)
+            seen_ids.add(detector_id)
+
+        except Exception as exc:  # noqa: BLE001
+            logger.error(
+                "Failed to load detector %s.%s: %s",
+                module_name, class_name, exc,
+                exc_info=True,
+            )
+
+    return detectors
+
+
+def _detector_needs_stateless_analysis(detector: BaseDetector) -> bool:
+    explicit_flag = getattr(detector, "NEEDS_STATELESS_ANALYSIS", None)
+    if isinstance(explicit_flag, bool):
+        return explicit_flag
+
+    detector_id = getattr(detector, "DETECTOR_ID", "")
+    class_name = detector.__class__.__name__
+
+    return (
+        detector_id in _STATELESS_DETECTOR_IDS
+        or class_name in _STATELESS_DETECTOR_CLASSES
+    )
+
+
+def _should_skip_function(
+    fn_info: FunctionInfo,
+    active_detectors: List[BaseDetector],
+) -> bool:
+    if any(_detector_needs_stateless_analysis(d) for d in active_detectors):
+        return False
+
+    has_state_writes = bool(fn_info.state_vars_written)
+    has_external_calls = bool(fn_info.external_calls)
+    return not has_state_writes and not has_external_calls
+
+
+class _TaintStage:
+    def run(
+        self,
+        fn_info: FunctionInfo,
+        contract_name: str,
+        cfg: CFGGraph,
+        dfg: DFGGraph,
+    ) -> Tuple[Optional[TaintResult], Optional[str]]:
+        try:
+            result = TaintEngine(cfg, dfg, fn_info).run()
+            return result, None
+        except Exception as exc:  # noqa: BLE001
+            msg = f"Taint analysis failed for '{contract_name}.{fn_info.name}': {exc}"
+            logger.warning(msg)
+            return None, msg
+
+
+class _DetectorStage:
+    def run(
+        self,
+        detectors: List[BaseDetector],
+        contract: ContractInfo,
+        fn_info: FunctionInfo,
+        cfg: CFGGraph,
+        dfg: DFGGraph,
+        taint_result: Optional[TaintResult],
+    ) -> Tuple[List[Finding], int, int]:
+        findings: List[Finding] = []
+        attempted = 0
+        successful = 0
+
+        for detector in detectors:
+            attempted += 1
+            try:
+                result = detector.detect(
+                    contract=contract,
+                    fn_info=fn_info,
+                    cfg=cfg,
+                    dfg=dfg,
+                    taint_result=taint_result,
+                )
+                successful += 1
+
+                if result:
+                    findings.extend(result)
+                    logger.debug(
+                        "Detector '%s' produced %d findings for '%s.%s'.",
+                        detector.DETECTOR_ID, len(result),
+                        contract.name, fn_info.name,
+                    )
+
+            except Exception as exc:  # noqa: BLE001
+                logger.error(
+                    "Detector '%s' raised an exception for '%s.%s': %s",
+                    getattr(detector, "DETECTOR_ID", detector.__class__.__name__),
+                    contract.name, fn_info.name, exc,
+                    exc_info=True,
+                )
+
+        return findings, attempted, successful
+
+
+class AnalysisEngine:
+    """
+    Orchestrates the full VigilanceCore analysis pipeline.
+
+    Default detectors are loaded dynamically from detector modules.
+    Any detector that fails to import is skipped with a logged error.
+    """
+
+    def __init__(
+        self,
+        tool_version: str = _ENGINE_VERSION,
+        network: Optional[str] = None,
+    ) -> None:
+        self.tool_version = tool_version
+        self.network = network
+
+        self._taint_stage = _TaintStage()
+        self._detector_stage = _DetectorStage()
+
+        self.detectors: List[BaseDetector] = _build_default_detectors()
+
+        logger.info(
+            "AnalysisEngine v%s initialised with %d detectors: %s",
+            self.tool_version,
+            len(self.detectors),
+            [d.DETECTOR_ID for d in self.detectors],
+        )
+
+        if not self.detectors:
+            logger.warning("No detectors were successfully loaded.")
+
+    def register(self, detector: BaseDetector) -> None:
+        existing_ids = [d.DETECTOR_ID for d in self.detectors]
+        if detector.DETECTOR_ID in existing_ids:
+            raise ValueError(
+                f"Detector '{detector.DETECTOR_ID}' is already registered."
+            )
+
+        self.detectors.append(detector)
+        logger.info(
+            "Detector registered: id=%r version=%r",
+            detector.DETECTOR_ID,
+            detector.DETECTOR_VERSION,
+        )
+
+    def unregister(self, detector_id: str) -> None:
+        before = len(self.detectors)
+        self.detectors = [d for d in self.detectors if d.DETECTOR_ID != detector_id]
+
+        if len(self.detectors) == before:
+            raise ValueError(f"Detector '{detector_id}' is not registered.")
+
+        logger.info("Detector unregistered: id=%r", detector_id)
+
+    @property
+    def registered_detectors(self) -> List[str]:
+        return [d.DETECTOR_ID for d in self.detectors]
+
+    def analyse(
+        self,
+        solidity_file: str,
+        network: Optional[str] = None,
+    ) -> AnalysisResult:
+        run_start = time.monotonic()
+        effective_network = network or self.network
+        stats = ScanStats()
+
+        active_detectors = list(self.detectors)
+        contracts: List[ContractInfo] = []
+
+        logger.info(
+            "Analysis started: file=%r detectors=%s network=%r",
+            solidity_file,
+            [d.DETECTOR_ID for d in active_detectors],
+            effective_network,
+        )
+
+        try:
+            wrapper = SlitherWrapper(input_path=solidity_file)
+            wrap_result = wrapper.run()
+
+            if not wrap_result.success:
+                error_msg = f"Slither failed for '{solidity_file}': {wrap_result.error}"
+                logger.error(error_msg)
+                stats.elapsed_ms = self._elapsed_ms(run_start)
+                return AnalysisResult(
+                    source_file=solidity_file,
+                    contracts=[],
+                    findings=[],
+                    stats=stats,
+                    tool_version=self.tool_version,
+                    network=effective_network,
+                    error=error_msg,
+                )
+
+            parser = ContractParser(wrapper)
+            contracts = parser.parse()
+
+        except Exception as exc:  # noqa: BLE001
+            error_msg = f"Parsing failed for '{solidity_file}': {exc}"
+            logger.error(error_msg, exc_info=True)
+            stats.elapsed_ms = self._elapsed_ms(run_start)
+            return AnalysisResult(
+                source_file=solidity_file,
+                contracts=[],
+                findings=[],
+                stats=stats,
+                tool_version=self.tool_version,
+                network=effective_network,
+                error=error_msg,
+            )
+
+        if not contracts:
+            logger.warning("No contracts found in '%s'.", solidity_file)
+            stats.elapsed_ms = self._elapsed_ms(run_start)
+            return AnalysisResult(
+                source_file=solidity_file,
+                contracts=[],
+                findings=[],
+                stats=stats,
+                tool_version=self.tool_version,
+                network=effective_network,
+                error=f"No contracts found in '{solidity_file}'.",
+            )
+
+        try:
+            cfg_analyser = CFGAnalyser(wrapper)
+            cfg_results: Dict[str, CFGAnalysisResult] = cfg_analyser.analyse(contracts)
+        except Exception as exc:  # noqa: BLE001
+            error_msg = f"CFG analysis failed for '{solidity_file}': {exc}"
+            logger.error(error_msg, exc_info=True)
+            stats.elapsed_ms = self._elapsed_ms(run_start)
+            return AnalysisResult(
+                source_file=solidity_file,
+                contracts=contracts,
+                findings=[],
+                stats=stats,
+                tool_version=self.tool_version,
+                network=effective_network,
+                error=error_msg,
+            )
+
+        all_findings: List[Finding] = []
+
+        for contract in contracts:
+            cfg_result = cfg_results.get(contract.name)
+            contract_findings, contract_stats = self._analyse_contract(
+                contract=contract,
+                cfg_result=cfg_result,
+                active_detectors=active_detectors,
+            )
+
+            all_findings.extend(contract_findings)
+            stats.contracts_analyzed += 1
+            stats.functions_analyzed += contract_stats.functions_analyzed
+            stats.functions_failed += contract_stats.functions_failed
+            stats.functions_skipped += contract_stats.functions_skipped
+            stats.detectors_attempted += contract_stats.detectors_attempted
+            stats.detectors_successful += contract_stats.detectors_successful
+
+        stats.findings_total = len(all_findings)
+        stats.elapsed_ms = self._elapsed_ms(run_start)
+
+        logger.info(
+            "Analysis complete: file=%r %s",
+            solidity_file, stats,
+        )
+
+        return AnalysisResult(
+            source_file=solidity_file,
+            contracts=contracts,
+            findings=all_findings,
+            stats=stats,
+            tool_version=self.tool_version,
+            network=effective_network,
+            error=None,
+        )
+
+    def _analyse_contract(
+        self,
+        contract: ContractInfo,
+        cfg_result: Optional[CFGAnalysisResult],
+        active_detectors: List[BaseDetector],
+    ) -> Tuple[List[Finding], ScanStats]:
+        findings: List[Finding] = []
+        stats = ScanStats()
+
+        logger.debug(
+            "Analysing contract '%s' (%d functions).",
+            contract.name, len(contract.functions),
+        )
+
+        for fn_info in contract.functions:
+            fn_analysis = self._analyse_function(
+                contract=contract,
+                fn_info=fn_info,
+                cfg_result=cfg_result,
+                active_detectors=active_detectors,
+            )
+
+            findings.extend(fn_analysis.findings)
+
+            if fn_analysis.was_skipped:
+                stats.functions_skipped += 1
+            elif fn_analysis.error:
+                stats.functions_failed += 1
+            else:
+                stats.functions_analyzed += 1
+
+            stats.detectors_attempted += fn_analysis.detectors_attempted
+            stats.detectors_successful += fn_analysis.detectors_successful
+
+        logger.debug(
+            "Contract '%s' done — %d findings.",
+            contract.name, len(findings),
+        )
+        return findings, stats
+
+    def _analyse_function(
+        self,
+        contract: ContractInfo,
+        fn_info: FunctionInfo,
+        cfg_result: Optional[CFGAnalysisResult],
+        active_detectors: List[BaseDetector],
+    ) -> _FunctionAnalysis:
+        result = _FunctionAnalysis(fn_info=fn_info)
+        fn_start = time.monotonic()
+
+        if _should_skip_function(fn_info, active_detectors):
+            result.was_skipped = True
+            result.duration_ms = self._elapsed_ms(fn_start)
+            logger.debug(
+                "Function '%s.%s' fast-path skip — no state writes, no external calls.",
+                contract.name, fn_info.name,
+            )
+            return result
+
+        cfg: Optional[CFGGraph] = None
+        dfg: Optional[DFGGraph] = None
+
+        if cfg_result is not None:
+            fn_graphs = cfg_result.get(fn_info.signature)
+            if fn_graphs is not None and not fn_graphs.build_error:
+                cfg = fn_graphs.cfg
+                dfg = fn_graphs.dfg
+            elif fn_graphs is not None and fn_graphs.build_error:
+                result.error = fn_graphs.build_error
+                result.duration_ms = self._elapsed_ms(fn_start)
+                logger.debug(
+                    "Function '%s.%s' failed — CFG/DFG build error: %s",
+                    contract.name, fn_info.name, fn_graphs.build_error,
+                )
+                return result
+
+        if cfg is None or dfg is None:
+            result.error = f"No CFG/DFG available for '{contract.name}.{fn_info.name}'."
+            result.duration_ms = self._elapsed_ms(fn_start)
+            logger.debug(
+                "Function '%s.%s' failed — no CFG/DFG available.",
+                contract.name, fn_info.name,
+            )
+            return result
+
+        result.cfg = cfg
+        result.dfg = dfg
+
+        taint_result, _taint_error = self._taint_stage.run(
+            fn_info=fn_info,
+            contract_name=contract.name,
+            cfg=cfg,
+            dfg=dfg,
+        )
+        result.taint_result = taint_result
+
+        findings, attempted, successful = self._detector_stage.run(
+            detectors=active_detectors,
+            contract=contract,
+            fn_info=fn_info,
+            cfg=cfg,
+            dfg=dfg,
+            taint_result=taint_result,
+        )
+
+        result.findings = findings
+        result.detectors_attempted = attempted
+        result.detectors_successful = successful
+        result.duration_ms = self._elapsed_ms(fn_start)
+
+        logger.debug(
+            "Function '%s.%s' done — %d findings, %d/%d detectors OK, %dms.",
+            contract.name, fn_info.name,
+            len(findings), successful, attempted, result.duration_ms,
+        )
+        return result
+
+    @staticmethod
+    def _elapsed_ms(start: float) -> int:
+        return int((time.monotonic() - start) * 1000)

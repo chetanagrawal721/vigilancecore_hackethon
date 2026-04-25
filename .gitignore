@@ -1,0 +1,75 @@
+# ── Virtual environments ────────────────────────────────────────
+.venv/
+venv/
+env/
+ENV/
+
+# ── Python bytecode & cache ─────────────────────────────────────
+__pycache__/
+*.py[cod]
+*$py.class
+*.pyo
+*.pyd
+.Python
+
+# ── Distribution / packaging ─────────────────────────────────────
+build/
+dist/
+*.egg-info/
+*.egg
+.eggs/
+wheels/
+
+# ── Testing & coverage ──────────────────────────────────────────
+.pytest_cache/
+.coverage
+.coverage.*
+htmlcov/
+coverage.xml
+*.cover
+
+# ── Type checkers ────────────────────────────────────────────────
+.mypy_cache/
+.pytype/
+.pyre/
+
+# ── Benchmark reports (generated output — don't commit) ─────────
+reports/benchmark_*.json
+reports/benchmark_*.csv
+# Keep the schema/README in reports/ if you have one:
+# !reports/README.md
+
+# ── Slither / solcx artefacts ───────────────────────────────────
+.slither/
+crytic-export/
+# solcx binaries live in ~/.solcx — already outside the repo
+
+# ── Jupyter / IPython ───────────────────────────────────────────
+.ipynb_checkpoints/
+*.ipynb
+
+# ── Environment variables ───────────────────────────────────────
+.env
+.env.*
+!.env.example
+
+# ── Logs ────────────────────────────────────────────────────────
+*.log
+logs/
+
+# ── OS noise ────────────────────────────────────────────────────
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# ── Editors ─────────────────────────────────────────────────────
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# ── Temp / scratch ──────────────────────────────────────────────
+tmp/
+temp/
+*.tmp
